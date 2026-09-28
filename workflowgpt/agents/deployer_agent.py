@@ -7,6 +7,7 @@ import httpx
 # Self-hosted n8n public API (same path shape as Cloud; only the host differs).
 _CREATE_PATH = "/api/v1/workflows"
 _ACTIVATE_PATH = "/api/v1/workflows/{workflow_id}/activate"
+_DELETE_PATH = "/api/v1/workflows/{workflow_id}"
 _API_KEY_HEADER = "X-N8N-API-KEY"
 
 
@@ -30,6 +31,69 @@ def deploy_workflow(
         raise N8nDeployError("n8n_api_key is required")
 
     return _create_and_activate(workflow_json, n8n_base_url.strip(), n8n_api_key.strip())
+
+
+def delete_remote_workflow(
+    workflow_id: str,
+    n8n_base_url: str,
+    n8n_api_key: str,
+) -> None:
+    """Delete a workflow from n8n. A missing workflow is treated as success."""
+    if not workflow_id or not str(workflow_id).strip():
+        return
+    if not n8n_base_url or not str(n8n_base_url).strip():
+        raise N8nDeployError("n8n_base_url is required (e.g. http://localhost:5678)")
+    if not n8n_api_key or not str(n8n_api_key).strip():
+        raise N8nDeployError("n8n_api_key is required")
+
+    url = _join_url(
+        n8n_base_url.strip(),
+        _DELETE_PATH.format(workflow_id=str(workflow_id).strip()),
+    )
+    try:
+        _request(
+            method="DELETE",
+            url=url,
+            n8n_api_key=n8n_api_key.strip(),
+            json_body=None,
+            action=f"delete workflow {workflow_id}",
+        )
+    except N8nDeployError as exc:
+        if "status 404" in str(exc):
+            return
+        raise
+
+
+def create_credential(
+    name: str,
+    credential_type: str,
+    data: dict[str, Any],
+    n8n_base_url: str,
+    n8n_api_key: str,
+) -> str:
+    """Create an n8n credential and return its id."""
+    if not n8n_base_url or not str(n8n_base_url).strip():
+        raise N8nDeployError("n8n_base_url is required (e.g. http://localhost:5678)")
+    if not n8n_api_key or not str(n8n_api_key).strip():
+        raise N8nDeployError("n8n_api_key is required")
+    payload = {
+        "name": name or credential_type,
+        "type": credential_type,
+        "data": data,
+    }
+    response = _request(
+        method="POST",
+        url=_join_url(n8n_base_url.strip(), "/api/v1/credentials"),
+        n8n_api_key=n8n_api_key.strip(),
+        json_body=payload,
+        action=f"create credential {name}",
+    )
+    credential_id = response.get("id")
+    if credential_id is None and isinstance(response.get("data"), dict):
+        credential_id = response["data"].get("id")
+    if credential_id is None or str(credential_id).strip() == "":
+        raise N8nDeployError(f"n8n create credential response missing id: {response}")
+    return str(credential_id)
 
 
 def _create_and_activate(

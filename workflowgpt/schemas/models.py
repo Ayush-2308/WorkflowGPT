@@ -31,6 +31,13 @@ class WorkflowSpec(BaseModel):
     raw_instruction: str
 
 
+class ClarificationQuestion(BaseModel):
+    id: str
+    prompt: str
+    secret: bool = False
+    placeholder: str = ""
+
+
 class PipelineState(BaseModel):
     request_id: str
     raw_instruction: str
@@ -40,3 +47,8 @@ class PipelineState(BaseModel):
     deployment_status: str
     test_result: Optional[dict[str, Any]] = None
     errors: list[str] = Field(default_factory=list)
+    assistant_message: Optional[str] = None
+    questions: list[dict[str, Any]] = Field(default_factory=list)
+    facts: dict[str, Any] = Field(default_factory=dict)
+    conversation: list[dict[str, str]] = Field(default_factory=list)
+    session_id: Optional[str] = None

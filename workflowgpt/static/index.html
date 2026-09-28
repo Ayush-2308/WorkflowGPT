@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>WorkflowGPT</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #171412;
+      --muted: #5f574e;
+      --line: #e6dfd4;
+      --paper: #f4efe6;
+      --card: #fffdf9;
+      --accent: #0d6b54;
+      --danger: #8a3b2b;
+      --bot: #efe8dc;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: "Segoe UI", system-ui, sans-serif;
+      color: var(--ink);
+      background: var(--paper);
+    }
+    main {
+      width: min(760px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 36px 0 64px;
+      display: flex;
+      flex-direction: column;
+      min-height: 100vh;
+    }
+    h1 { margin: 0 0 6px; font-family: Georgia, serif; font-size: 34px; }
+    p.lead { margin: 0 0 20px; color: var(--muted); }
+    #log {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      margin-bottom: 16px;
+    }
+    .bubble {
+      max-width: 90%;
+      padding: 12px 14px;
+      border-radius: 14px;
+      line-height: 1.45;
+      white-space: pre-wrap;
+    }
+    .user { align-self: flex-end; background: var(--accent); color: #fff; }
+    .bot { align-self: flex-start; background: var(--bot); }
+    .result a { color: var(--accent); }
+    form {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      padding: 16px;
+    }
+    textarea, input {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 10px 12px;
+      font: 16px/1.4 "Segoe UI", sans-serif;
+    }
+    textarea { min-height: 90px; resize: vertical; }
+    .q { margin-top: 12px; }
+    .q label { display: block; margin-bottom: 6px; color: var(--muted); font-size: 14px; }
+    button {
+      margin-top: 12px;
+      border: 0;
+      border-radius: 999px;
+      padding: 11px 16px;
+      background: var(--accent);
+      color: #fff;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    button:disabled { opacity: 0.6; }
+    #key-field { margin-top: 10px; }
+    .errors { color: var(--danger); margin: 8px 0 0; padding-left: 18px; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>WorkflowGPT</h1>
+    <p class="lead">Describe any n8n automation. If something is missing — tokens, IDs, a region, a sheet URL — the agent asks, then builds it in n8n.</p>
+    <div id="log"></div>
+    <form id="composer">
+      <label for="instruction">Message</label>
+      <textarea id="instruction" required placeholder="Comment on new leads from Maharashtra on my Facebook page."></textarea>
+      <div id="questions"></div>
+      <div id="key-field" hidden>
+        <label for="api-key">API key</label>
+        <input id="api-key" type="password" autocomplete="off">
+      </div>
+      <button type="submit" id="send">Send</button>
+    </form>
+  </main>
+  <script>
+    const sessionKey = "workflowgpt-session";
+    const logEl = document.querySelector("#log");
+    const form = document.querySelector("#composer");
+    const send = document.querySelector("#send");
+    const questionsEl = document.querySelector("#questions");
+    let pendingQuestions = [];
+
+    fetch("/health").then((r) => r.json()).then((body) => {
+      if (body.auth_required) document.querySelector("#key-field").hidden = false;
+    }).catch(() => {});
+
+    addBot("Tell me the automation you want. I will ask for any keys, accounts, or IDs I need, then deploy the workflow to n8n.");
+
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const message = document.querySelector("#instruction").value.trim() || (
+        pendingQuestions.length ? "Here are the details you asked for." : ""
+      );
+      if (!message && !pendingQuestions.length) return;
+      const answers = {};
+      for (const q of pendingQuestions) {
+        const field = document.querySelector("#q-" + CSS.escape(q.id));
+        if (field && field.value.trim()) answers[q.id] = field.value.trim();
+      }
+      if (message) addUser(message);
+      send.disabled = true;
+      addBot("Working…");
+      const headers = { "Content-Type": "application/json" };
+      const apiKey = document.querySelector("#api-key").value.trim();
+      if (apiKey) headers["X-API-Key"] = apiKey;
+      try {
+        const response = await fetch("/agent", {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            message,
+            session_id: localStorage.getItem(sessionKey) || undefined,
+            answers,
+          }),
+        });
+        const body = await response.json();
+        removeLastBotIfWorking();
+        if (!response.ok) {
+          addBot(detailText(body, response));
+          return;
+        }
+        if (body.session_id) localStorage.setItem(sessionKey, body.session_id);
+        showAgentResult(body);
+      } catch (error) {
+        removeLastBotIfWorking();
+        addBot(error instanceof Error ? error.message : "Request failed");
+      } finally {
+        send.disabled = false;
+        document.querySelector("#instruction").value = "";
+      }
+    });
+
+    function showAgentResult(body) {
+      const lines = [];
+      if (body.assistant_message) lines.push(body.assistant_message);
+      if (body.n8n_workflow_url) {
+        lines.push("Open in n8n: " + body.n8n_workflow_url);
+      } else if (body.deployment_status && body.deployment_status !== "needs_input") {
+        lines.push("Status: " + body.deployment_status);
+      }
+      addBot(lines.join("\n\n") || "Done.");
+      if (body.n8n_workflow_url) {
+        const last = logEl.lastElementChild;
+        last.innerHTML = last.textContent.replace(
+          body.n8n_workflow_url,
+          '<a href="' + body.n8n_workflow_url + '" target="_blank" rel="noreferrer">' + body.n8n_workflow_url + "</a>"
+        );
+      }
+      pendingQuestions = body.questions || [];
+      renderQuestions(pendingQuestions);
+      if (body.errors && body.errors.length) {
+        const list = document.createElement("ul");
+        list.className = "errors";
+        for (const err of body.errors) {
+          const item = document.createElement("li");
+          item.textContent = err;
+          list.append(item);
+        }
+        logEl.append(list);
+      }
+    }
+
+    function renderQuestions(questions) {
+      questionsEl.replaceChildren();
+      for (const q of questions) {
+        const wrap = document.createElement("div");
+        wrap.className = "q";
+        const label = document.createElement("label");
+        label.setAttribute("for", "q-" + q.id);
+        label.textContent = q.prompt;
+        const input = document.createElement("input");
+        input.id = "q-" + q.id;
+        input.placeholder = q.placeholder || "";
+        if (q.secret) input.type = "password";
+        wrap.append(label, input);
+        questionsEl.append(wrap);
+      }
+    }
+
+    function addUser(text) {
+      const el = document.createElement("div");
+      el.className = "bubble user";
+      el.textContent = text;
+      logEl.append(el);
+    }
+    function addBot(text) {
+      const el = document.createElement("div");
+      el.className = "bubble bot";
+      el.textContent = text;
+      logEl.append(el);
+    }
+    function removeLastBotIfWorking() {
+      const last = logEl.lastElementChild;
+      if (last && last.textContent === "Working…") last.remove();
+    }
+    function detailText(body, response) {
+      const detail = body.detail?.error || body.detail || response.statusText;
+      return typeof detail === "string" ? detail : JSON.stringify(detail);
+    }
+  </script>
+</body>
+</html>

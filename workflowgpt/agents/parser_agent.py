@@ -6,7 +6,10 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from config import LLM_PROVIDER
+import httpx
+from anthropic import Anthropic
+
+from config import GEMINI_BASE_URL, LLM_API_KEY, LLM_MODEL, LLM_PROVIDER, OPENAI_BASE_URL
 from schemas.models import WorkflowSpec
 
 _JSON_FENCE_RE = re.compile(r"```(?:json)?\s*([\s\S]*?)\s*```", re.IGNORECASE)
@@ -239,9 +242,110 @@ def _extract_json_object(raw_response: str) -> dict[str, Any]:
     return payload
 
 
-def _call_llm(prompt: str) -> str:
-    """LLM client is wired after you confirm the provider and model."""
-    raise NotImplementedError(
-        "LLM API call is not implemented yet. Confirm provider and model first. "
-        f"Current LLM_PROVIDER from config: {LLM_PROVIDER!r}"
+def _call_llm(prompt: str, max_tokens: int = 4096) -> str:
+    """Call the configured LLM and return the assistant text (JSON-only prompt)."""
+    provider = (LLM_PROVIDER or "anthropic").strip().lower()
+    api_key = (LLM_API_KEY or "").strip()
+    if not api_key:
+        raise ValueError("LLM_API_KEY is required")
+    if provider == "anthropic":
+        return _call_anthropic(prompt, api_key, max_tokens=max_tokens)
+    if provider == "openai":
+        return _call_openai(prompt, api_key, max_tokens=max_tokens)
+    if provider == "gemini":
+        return _call_gemini(prompt, api_key, max_tokens=max_tokens)
+    raise ValueError(
+        f"Unsupported LLM_PROVIDER={LLM_PROVIDER!r}. Use 'anthropic', 'openai', or 'gemini'."
     )
+
+
+def _call_anthropic(prompt: str, api_key: str, max_tokens: int = 4096) -> str:
+    client = Anthropic(api_key=api_key)
+    message = client.messages.create(
+        model=(LLM_MODEL or "claude-sonnet-4-5").strip(),
+        max_tokens=max_tokens,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    parts = [
+        block.text
+        for block in message.content
+        if getattr(block, "type", None) == "text" and getattr(block, "text", None)
+    ]
+    text = "".join(parts).strip()
+    if not text:
+        raise ValueError("Anthropic returned an empty response")
+    return text
+
+
+def _call_openai(prompt: str, api_key: str, max_tokens: int = 4096) -> str:
+    model = (LLM_MODEL or "").strip()
+    if not model or model.startswith("claude"):
+        model = "gpt-4o-mini"
+    base = (OPENAI_BASE_URL or "https://api.openai.com/v1").strip().rstrip("/")
+    try:
+        response = httpx.post(
+            f"{base}/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": model,
+                "temperature": 0,
+                "max_tokens": max_tokens,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+            timeout=60.0,
+        )
+    except httpx.HTTPError as exc:
+        raise ValueError(f"OpenAI request failed: {exc}") from exc
+    if response.is_error:
+        raise ValueError(
+            f"OpenAI request failed with status {response.status_code}: {response.text}"
+        )
+    payload = response.json()
+    choices = payload.get("choices") or []
+    if not choices or not isinstance(choices[0], dict):
+        raise ValueError("OpenAI returned no choices")
+    message = choices[0].get("message") or {}
+    text = str(message.get("content") or "").strip()
+    if not text:
+        raise ValueError("OpenAI returned an empty response")
+    return text
+
+
+def _call_gemini(prompt: str, api_key: str, max_tokens: int = 4096) -> str:
+    model = (LLM_MODEL or "").strip()
+    if not model or model.startswith("claude") or model.startswith("gpt-"):
+        model = "gemini-3.8-flash"
+    base = (GEMINI_BASE_URL or "https://generativelanguage.googleapis.com/v1beta").strip().rstrip("/")
+    try:
+        response = httpx.post(
+            f"{base}/models/{model}:generateContent",
+            headers={
+                "x-goog-api-key": api_key,
+                "Content-Type": "application/json",
+            },
+            json={
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {"temperature": 0, "maxOutputTokens": max_tokens},
+            },
+            timeout=60.0,
+        )
+    except httpx.HTTPError as exc:
+        raise ValueError(f"Gemini request failed: {exc}") from exc
+    if response.is_error:
+        raise ValueError(
+            f"Gemini request failed with status {response.status_code}: {response.text}"
+        )
+    payload = response.json()
+    candidates = payload.get("candidates") or []
+    if not candidates or not isinstance(candidates[0], dict):
+        raise ValueError("Gemini returned no candidates")
+    parts = ((candidates[0].get("content") or {}).get("parts")) or []
+    text = "".join(
+        str(part.get("text") or "") for part in parts if isinstance(part, dict)
+    ).strip()
+    if not text:
+        raise ValueError("Gemini returned an empty response")
+    return text
