@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from typing import Any
 
 from pydantic import ValidationError
@@ -319,33 +320,46 @@ def _call_gemini(prompt: str, api_key: str, max_tokens: int = 4096) -> str:
     if not model or model.startswith("claude") or model.startswith("gpt-"):
         model = "gemini-3.8-flash"
     base = (GEMINI_BASE_URL or "https://generativelanguage.googleapis.com/v1beta").strip().rstrip("/")
-    try:
-        response = httpx.post(
-            f"{base}/models/{model}:generateContent",
-            headers={
-                "x-goog-api-key": api_key,
-                "Content-Type": "application/json",
-            },
-            json={
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {"temperature": 0, "maxOutputTokens": max_tokens},
-            },
-            timeout=60.0,
-        )
-    except httpx.HTTPError as exc:
-        raise ValueError(f"Gemini request failed: {exc}") from exc
-    if response.is_error:
-        raise ValueError(
-            f"Gemini request failed with status {response.status_code}: {response.text}"
-        )
-    payload = response.json()
-    candidates = payload.get("candidates") or []
-    if not candidates or not isinstance(candidates[0], dict):
-        raise ValueError("Gemini returned no candidates")
-    parts = ((candidates[0].get("content") or {}).get("parts")) or []
-    text = "".join(
-        str(part.get("text") or "") for part in parts if isinstance(part, dict)
-    ).strip()
-    if not text:
-        raise ValueError("Gemini returned an empty response")
-    return text
+    url = f"{base}/models/{model}:generateContent"
+    last_error = "Gemini request failed"
+    for attempt in range(4):
+        try:
+            response = httpx.post(
+                url,
+                headers={
+                    "x-goog-api-key": api_key,
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "contents": [{"parts": [{"text": prompt}]}],
+                    "generationConfig": {"temperature": 0, "maxOutputTokens": max_tokens},
+                },
+                timeout=60.0,
+            )
+        except httpx.HTTPError as exc:
+            last_error = f"Gemini request failed: {exc}"
+            time.sleep(2 ** attempt)
+            continue
+        if getattr(response, "status_code", 0) in {429, 503}:
+            last_error = (
+                f"Gemini is busy (status {response.status_code}). "
+                "Wait about a minute and send the same message again."
+            )
+            time.sleep(2 ** attempt)
+            continue
+        if response.is_error:
+            raise ValueError(
+                f"Gemini request failed with status {response.status_code}: {response.text}"
+            )
+        payload = response.json()
+        candidates = payload.get("candidates") or []
+        if not candidates or not isinstance(candidates[0], dict):
+            raise ValueError("Gemini returned no candidates")
+        parts = ((candidates[0].get("content") or {}).get("parts")) or []
+        text = "".join(
+            str(part.get("text") or "") for part in parts if isinstance(part, dict)
+        ).strip()
+        if not text:
+            raise ValueError("Gemini returned an empty response")
+        return text
+    raise ValueError(last_error)
